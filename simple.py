@@ -38,12 +38,15 @@ while True:
     if user_input.lower() == 'quit':
         print("Goodbye!")
         break
+
+    #get a new state after the invoke
     state=graph.invoke({"messages": state["messages"] + [("user", user_input)]}) # in python, put a two list togehter we can use + operator or [*list1, *list2]
     
     # Extract and display the assistant's response in readable format
     messages = state["messages"]
     if messages:
         last_message = messages[-1]
+        print("Debug - Last message object:", last_message)  # Debugging line
         if hasattr(last_message, 'content'):
             assistant_response = last_message.content
         else:
