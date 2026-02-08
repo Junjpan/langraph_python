@@ -11,12 +11,64 @@ load_dotenv()
 
 llm=init_chat_model("claude-haiku-4-5-20251001", temperature=0)
 
+MAX_TURNS=3
+MAX_MESSAGES=MAX_TURNS*2  # each turn has user message and assistant message
+
 # define the State type, used for runtime state management in LangGraph
 # add context-specific metadata to a type. Annotated Type allows you to attach metadata to a type.
 # to accept TypeDict data, we only can use squre bracket or using .get method to access the value, .get() method also accepts an optional second argument to provide a default value if the key is not found.
 class State(TypedDict):
     messages: Annotated[list, add_messages] #add_message is a reducer that helps manage chat messages
     message_type: str| None
+    summary: str| None
+
+#helper function to split old message and new message in turple format
+def split_messages(messages:list):
+    if len(messages) <= MAX_MESSAGES:
+        return None, messages
+    else:
+        return messages[:-MAX_MESSAGES], messages[-MAX_MESSAGES:]
+    
+def SummaryGenerator(state: State):
+    messages = state["messages"]
+    previous_summary = state.get("summary", "")
+
+    # Filter out any existing summary system messages
+    non_summary_messages = [
+        m for m in messages
+        if not (
+            isinstance(m, dict)
+            and m.get("role") == "system"
+            and m.get("content", "").startswith("Conversation summary")
+        )
+    ]
+    old_messages, new_messages = split_messages(non_summary_messages)
+    if not old_messages:
+        return  {}
+    
+    #for content: () , the () is used to group multiple lines into a single string for better readability
+    prompt=[
+        {"role": "system", "content": "You are a helpful assistant that summarizes conversations."},
+        {
+            "role": "user",
+            "content": (
+                f"Previous summary:\n"
+                f"{previous_summary or 'None'}\n\n"
+                f"Old conversation messages:\n"
+                + "\n".join(
+                    f"{m['role']}: {m['content']}" if isinstance(m, dict)
+                    else f"{type(m).__name__}: {m.content}"
+                    for m in old_messages
+                )
+            )
+        }]
+    updated_summary=llm.invoke(prompt).content
+    return {"summary": updated_summary, "messages": [
+            {
+                "role": "system",
+                "content": f"Conversation summary so far: {updated_summary}"
+            }
+        ] + new_messages}
 
 # used to classify user messages output by the LLM, ... means required field without default value, Literal limits the field to specific string values
 # we always use pydantic BaseModel to define LLM output structure/schema, and the model will use the description to better understand the field purpose and generate more accurate output
@@ -40,6 +92,8 @@ def classify_message(state: State) :
     # whatever we return here will be merged into the State that matches the State type
     return {'message_type': result.message_type}
 
+
+
 # we are still able to get the 'next_node' field even it's not defined in the State type, it's ok to not define all the fields in the State type.
 def router(state: State):
     message_type=state.get("message_type")
@@ -48,40 +102,77 @@ def router(state: State):
     return {'next_node': 'logical'}
 
 def therapist_agent(state: State):
-    message_history=state["messages"][-5:] if len(state["messages"]) > 5 else state["messages"] 
-    message=[{
-        "role": "system",
-        "content":"""You are a compassionate therapist. Focus on the emotional aspects of the user's message.
+    # Extract summary if present and filter out all system messages (dict or message objects)
+    summary_text = ""
+    other_messages = []
+    for m in state["messages"]:
+        # determine role and content for both dict and LangChain message objects
+        if isinstance(m, dict):
+            role = m.get("role")
+            content = m.get("content", "")
+        else:
+            role = getattr(m, "type", None) or getattr(m, "role", None)
+            content = getattr(m, "content", "") 
+        if role == "system":
+            if content.startswith("Conversation summary"):
+                summary_text = content
+            # drop other system messages
+        else:
+            other_messages.append(m)
+
+    system_content = """You are a compassionate therapist. Focus on the emotional aspects of the user's message.
                         Show empathy, validate their feelings, and help them process their emotions.
                         Ask thoughtful questions to help them explore their feelings more deeply.
                         Avoid giving logical solutions unless explicitly asked."""
-    }] + message_history
-    reply=llm.invoke(message)
+    if summary_text:
+        system_content += f"\n\nHere is the summary of conversation before: {summary_text}"
+
+    message = [{"role": "system", "content": system_content}] + other_messages
+    reply = llm.invoke(message)
     return {"messages": [{"role": "assistant", "content": reply.content}]}
 
 def logical_agent(state: State):
-    message_history=state["messages"][-5:] if len(state["messages"]) > 5 else state["messages"]  
-    message=[{
-        "role": "system",
-        "content":  """You are a purely logical assistant. Focus only on facts and information.
+    # Extract summary if present and filter out all system messages (dict or message objects)
+    summary_text = ""
+    other_messages = []
+    for m in state["messages"]:
+        # determine role and content for both dict and LangChain message objects
+        if isinstance(m, dict):
+            role = m.get("role")
+            content = m.get("content", "")
+        else:
+            role = getattr(m, "type", None) or getattr(m, "role", None)
+            content = getattr(m, "content", "")
+        if role == "system":
+            if content.startswith("Conversation summary"):
+                summary_text = content
+            # drop other system messages
+        else:
+            other_messages.append(m)
+
+    system_content = """You are a purely logical assistant. Focus only on facts and information.
             Provide clear, concise answers based on logic and evidence.
             Do not address emotions or provide emotional support.
             Be direct and straightforward in your responses."""
-    }] + message_history
-    
-    reply=llm.invoke(message)
+    if summary_text:
+        system_content += f"\n\nHere is the summary of conversation before: {summary_text}"
+
+    message = [{"role": "system", "content": system_content}] + other_messages
+    reply = llm.invoke(message)
     return {"messages": [{"role": "assistant", "content": reply.content}]}
 
 # Allow LangGraph to build a graph based on the State type
 graph_builder = StateGraph(State)
 
 graph_builder.add_node('classify', classify_message)
+graph_builder.add_node('summary', SummaryGenerator)
 graph_builder.add_node('router', router)
 graph_builder.add_node('therapist', therapist_agent)
 graph_builder.add_node('logical', logical_agent)
 
 graph_builder.add_edge(START, 'classify')
-graph_builder.add_edge('classify', 'router')
+graph_builder.add_conditional_edges('classify', lambda state:'summary' if len(state['messages']) > MAX_MESSAGES else 'router', {'summary':'summary','router':'router'})
+graph_builder.add_edge('summary', 'router')
 #the lamda function's code is equal to (state) => state.next_node in javascript
 graph_builder.add_conditional_edges('router', lambda state: state['next_node'], {'therapist': 'therapist', 'logical': 'logical'})
 graph_builder.add_edge('therapist', END)
@@ -91,10 +182,10 @@ graph=graph_builder.compile()
 
 
 def run_chatbot():
-    state={"messages":[],"message_type":None}
+    state={"messages":[],"message_type":None,"summary":None}
 
     while True:
-        userInput=input('Please let me what I can help you with:')
+        userInput=input('Please let me know what I can help you with:')
 
         if userInput.lower()=='quit':
             print("Goodbye!")
